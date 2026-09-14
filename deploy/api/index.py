@@ -5,21 +5,35 @@ Vercel Serverless Function - Sudan Exam Results API
 
 from http.server import BaseHTTPRequestHandler
 import gzip
+import io
 import json
 import os
 import re
 import sqlite3
 import urllib.parse
 
-# في بيئة Vercel، مجلد /tmp هو المكان الوحيد القابل للكتابة
 DB_TMP_PATH = "/tmp/results.db"
-GZ_PATH = os.path.join(os.path.dirname(__file__), "..", "results.db.gz")
+BASE_DIR = os.path.join(os.path.dirname(__file__), "..")
 
 
 def ensure_db():
     if not os.path.exists(DB_TMP_PATH) or os.path.getsize(DB_TMP_PATH) == 0:
-        if os.path.exists(GZ_PATH):
-            with gzip.open(GZ_PATH, "rb") as f_in:
+        gz_path = os.path.join(BASE_DIR, "results.db.gz")
+        part1 = os.path.join(BASE_DIR, "results.db.gz.001")
+        part2 = os.path.join(BASE_DIR, "results.db.gz.002")
+
+        if os.path.exists(part1) and os.path.exists(part2):
+            buf = io.BytesIO()
+            with open(part1, "rb") as f1:
+                buf.write(f1.read())
+            with open(part2, "rb") as f2:
+                buf.write(f2.read())
+            buf.seek(0)
+            with gzip.GzipFile(fileobj=buf) as gz:
+                with open(DB_TMP_PATH, "wb") as f_out:
+                    f_out.write(gz.read())
+        elif os.path.exists(gz_path):
+            with gzip.open(gz_path, "rb") as f_in:
                 with open(DB_TMP_PATH, "wb") as f_out:
                     f_out.write(f_in.read())
 
@@ -69,6 +83,10 @@ def search_name(query: str, limit: int = 50):
     if not tokens:
         return []
 
+    p_full = f"{norm}%"
+    p_first = f"{tokens[0]} %"
+    p_two = f"{tokens[0]} {tokens[1]}%" if len(tokens) >= 2 else p_full
+
     with sqlite3.connect(DB_TMP_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -76,14 +94,20 @@ def search_name(query: str, limit: int = 50):
         try:
             cur.execute(
                 f"""
-            SELECT s.seat, s.name, s.pct, s.result, s.rank_national, s.percentile_all, s.percentile_pass
+            SELECT s.seat, s.name, s.pct, s.result, s.rank_national, s.percentile_all, s.percentile_pass,
+              CASE
+                WHEN s.name_normalized LIKE ? THEN 1
+                WHEN s.name_normalized LIKE ? THEN 2
+                WHEN s.name_normalized LIKE ? THEN 3
+                ELSE 4
+              END AS relevance
             FROM students s
             JOIN students_fts f ON s.seat = f.rowid
             WHERE students_fts MATCH ?
-            ORDER BY s.pct DESC
+            ORDER BY relevance ASC, s.pct DESC
             LIMIT ?
             """,
-                (fts_match, limit),
+                (p_full, p_two, p_first, fts_match, limit),
             )
             rows = cur.fetchall()
             if rows:
@@ -103,13 +127,19 @@ def search_name(query: str, limit: int = 50):
             pass
 
         like_clauses = " AND ".join(["name_normalized LIKE ?"] * len(tokens))
-        params = [f"%{t}%" for t in tokens] + [limit]
+        params = [p_full, p_two, p_first] + [f"%{t}%" for t in tokens] + [limit]
         cur.execute(
             f"""
-        SELECT seat, name, pct, result, rank_national, percentile_all, percentile_pass
+        SELECT seat, name, pct, result, rank_national, percentile_all, percentile_pass,
+          CASE
+            WHEN name_normalized LIKE ? THEN 1
+            WHEN name_normalized LIKE ? THEN 2
+            WHEN name_normalized LIKE ? THEN 3
+            ELSE 4
+          END AS relevance
         FROM students
         WHERE {like_clauses}
-        ORDER BY pct DESC
+        ORDER BY relevance ASC, pct DESC
         LIMIT ?
         """,
             params,
